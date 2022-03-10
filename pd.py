@@ -27,37 +27,16 @@ Data = namedtuple('Data', ['ss', 'es', 'val'])
 OUTPUT_PYTHON format:
 
 Packet:
-[<ptype>, <data1>, <data2>]
+[<ptype>, <data1>]
 
 <ptype>:
- - 'DATA': <data1> contains the MOSI data, <data2> contains the MISO data.
-   The data is _usually_ 8 bits (but can also be fewer or more bits).
-   Both data items are Python numbers (not strings), or None if the respective
-   channel was not supplied.
- - 'BITS': <data1>/<data2> contain a list of bit values in this MOSI/MISO data
-   item, and for each of those also their respective start-/endsample numbers.
- - 'CS-CHANGE': <data1> is the old CS# pin value, <data2> is the new value.
-   Both data items are Python numbers (0/1), not strings. At the beginning of
-   the decoding a packet is generated with <data1> = None and <data2> being the
-   initial state of the CS# pin or None if the chip select pin is not supplied.
- - 'TRANSFER': <data1>/<data2> contain a list of Data() namedtuples for each
-   byte transferred during this block of CS# asserted time. Each Data() has
+ - 'TRANSFER': <data1> contain a list of Data() namedtuples for each
+   byte transferred during this block transfer. Each Data() has
    fields ss, es, and val.
 
 Examples:
- ['CS-CHANGE', None, 1]
- ['CS-CHANGE', 1, 0]
- ['DATA', 0xff, 0x3a]
- ['BITS', [[1, 80, 82], [1, 83, 84], [1, 85, 86], [1, 87, 88],
-           [1, 89, 90], [1, 91, 92], [1, 93, 94], [1, 95, 96]],
-          [[0, 80, 82], [1, 83, 84], [0, 85, 86], [1, 87, 88],
-           [1, 89, 90], [1, 91, 92], [0, 93, 94], [0, 95, 96]]]
- ['DATA', 0x65, 0x00]
- ['DATA', 0xa8, None]
- ['DATA', None, 0x55]
- ['CS-CHANGE', 0, 1]
- ['TRANSFER', [Data(ss=80, es=96, val=0xff), ...],
-              [Data(ss=80, es=96, val=0x3a), ...]]
+ ['TRANSFER', [Data(ss=80, es=96, val=0xff), 
+              Data(ss=80, es=96, val=0x3a), ...]]
 '''
 
 class ChannelError(Exception):
@@ -96,19 +75,19 @@ class Decoder(srd.Decoder):
     )
     annotation_rows = (
         ('rx-bits', 'RX bits', (ann_bit,)),
-        ('data-vals', 'data', (ann_data,ann_data_type,)),
+        ('data-vals', 'data', (ann_data,)),
+        ('data-types', 'type', (ann_data_type,)),
         ('transfers', 'transfers', (ann_transfer,)),
         ('other', 'Other', (ann_warning,)),
     )
     binary = (
-        ('data', 'DATA'),
+        ('transfer', 'transfer'),
     )
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.samplerate = None
         self.bitcount = 0           # Actual shifted bit number
         self.rxdata = 0             # Received data byte
         self.rxbits = []            # Received bits (tuple, [start, end, value])
@@ -117,17 +96,16 @@ class Decoder(srd.Decoder):
         self.ss_prev_clock = -1     # Previous clock samplenum
         self.ss_prev_false = -1     # samplenum at previous false
         self.flag_found = False     # Start flag found
-        self.ss_flag = -1           # samplenum at start flag
         self.have_en = None         # Use enable signal
         self.one_count = 0          # Number of consecutive 1
         self.prev_one_count = 0     # Previous number of consecutive 1
+        self.abort = None           # Abort packet
+        self.flag = None
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
         self.out_ann = self.register(srd.OUTPUT_ANN)
         self.out_binary = self.register(srd.OUTPUT_BINARY)
-        self.out_bitrate = self.register(srd.OUTPUT_META,
-                meta=(int, 'Bitrate', 'Bitrate during transfers'))
 
     #Check if ENABLE is asserted
     def en_asserted(self, en):
@@ -135,12 +113,10 @@ class Decoder(srd.Decoder):
         return (en == 0) if active_low else (en == 1)
 
     #Computes frame CRC
-    def crc16(data, length):
-        if data is None and length > len(data):
-            return 0
+    def crc16(self, data):        
         crc = 0xFFFF
-        for i in range(0, length):
-            crc ^= data[i] << 0
+        for i in range(0, (len(data)-2)):
+            crc ^= data[i][2] << 0
             for j in range(0,8):
                 if (crc & 0x0001) > 0:
                     crc =(crc >> 1) ^ 0x8408
@@ -148,7 +124,44 @@ class Decoder(srd.Decoder):
                     crc = crc >> 1
         crc = (crc & 0xFFFF) ^ 0xFFFF
         return crc
+    
+    #Resets state, EN is not asserted
+    def reset_state(self):
+        self.bitcount = 0           # Actual shifted bit number
+        self.rxdata = 0             # Received data byte
+        self.rxbits = []            # Received bits (tuple, [start, end, value])
+        self.rxbytes = []           # Received bytes (tuple, [start, end, value])
+        self.prev_bit = None        # Previous bit state
+        self.ss_prev_clock = -1     # Previous clock samplenum
+        self.ss_prev_false = -1     # samplenum at previous false
+        self.flag_found = False     # Start flag found
+        self.one_count = 0          # Number of consecutive 1
+        self.abort = None           # Abort packet location
+        self.flag = None            # Floag packet location
 
+    #Displays transfer
+    def putt(self):
+        if len(self.rxbytes) > 4:
+            # Transfer valid (Address + control + CRC-16)
+            self.put(self.rxbytes[0][0], self.rxbytes[-2][0], self.out_ann, [ann_data_type, ['TRANSFER']])
+            self.put(self.rxbytes[-2][0], self.rxbytes[-1][1], self.out_ann, [ann_data_type, ['CRC']])
+            transData = []
+            transBytes = []
+            for x in self.rxbytes[0:-2]:
+                transData.append(Data(ss=x[0], es=x[1], val=x[2]))
+                transBytes.append(x[2])
+            crc = self.crc16(self.rxbytes)
+            rxCrc = ((self.rxbytes[-1][2] & 0xFF) << 8) | (self.rxbytes[-2][2] & 0xFF)
+            if(crc != rxCrc):
+                self.put(self.rxbytes[0][0], self.rxbytes[-1][1], self.out_ann, [ann_warning, ['BAD CRC!']])    
+            else:
+                #Send to python
+                self.put(self.rxbytes[0][0], self.rxbytes[-2][0], self.out_python,
+                    ['TRANSFER', transData])
+                #Send to binay
+                self.put(self.rxbytes[0][0], self.rxbytes[-2][0], self.out_binary, transBytes)
+            self.put(self.rxbytes[0][0], self.rxbytes[-1][1], self.out_ann, [ann_transfer, [' '.join(format(x.val, '02X') for x in transData)]])    
+            
     #Shifts bit
     def shift_bit(self, data):
         if self.flag_found:
@@ -164,36 +177,51 @@ class Decoder(srd.Decoder):
         self.ss_prev_clock = self.samplenum
         self.prev_bit = data
 
-        #Flag
-        if self.prev_one_count == 6:
-            self.put(self.ss_flag, self.samplenum, self.out_ann, [ann_data_type, ['FLAG']])
-        elif self.prev_one_count > 6:
-            self.put(self.ss_flag, self.samplenum, self.out_ann, [ann_data_type, ['ABORT']])
-
-        #Display previsous data
+        #Number of bits reached
         if self.bitcount == 8:
             self.put(self.rxbits[0][1], self.samplenum, self.out_ann,
                                 [ann_data, ['%02X' % self.rxdata]])
+            self.rxbytes.append([self.rxbits[0][1], self.samplenum, self.rxdata])
             self.rxdata = 0
             self.bitcount = 0
             self.rxbits = []
 
+        #Display abort packet
+        if self.abort is not None:
+            self.put(self.abort[0], self.samplenum, self.out_ann, [ann_data_type, ['ABORT']])
+            self.abort = None
+        #Same for flag
+        if self.flag is not None:
+            self.put(self.flag[0], self.samplenum, self.out_ann, [ann_data_type, ['FLAG']])
+            self.flag = None
+            # Display previous transfer (if relevant)
+            self.putt()
+            self.rxbytes = []
+
         #Count number of 1
         if data == 1:
-            self.shift_bit(data)
+            if self.one_count < 5:
+                self.shift_bit(data)
             self.one_count += 1
         else:
-            if self.one_count > 5:
-                self.ss_flag = self.ss_prev_false
-                self.flag_found = False
-
             if self.one_count == 6:
+                # Found flag
                 self.flag_found = True
+                self.flag = [self.ss_prev_false, self.samplenum]                
                 self.rxdata = 0
                 self.bitcount = 0
                 self.rxbits = []
+            elif self.one_count > 6:
+                #Abort
+                self.abort = [self.ss_prev_false, self.samplenum]
+                self.flag_found = False
+                self.rxdata = 0
+                self.bitcount = 0
+                self.rxbits = []
+            #Skip the 0 if 5 one in a row
             elif self.one_count < 5:
                 self.shift_bit(data)
+            
             self.prev_one_count = self.one_count
             self.one_count = 0
             self.ss_prev_false = self.samplenum
@@ -202,18 +230,13 @@ class Decoder(srd.Decoder):
     def find_clk_edge(self, clk, data, en, first):
         # We only care about samples if CS# is asserted.
         if self.have_en and not self.en_asserted(en):
-            self.rxdata = 0
-            self.bitcount = 0
-            self.rxbits = []
-            self.rxbytes = []
-            self.one_count = 0
-            self.ss_prev_clock = -1
+            self.reset_state()
             return
         # Ignore sample if the clock pin hasn't changed.
         if first or not self.matched[0]:
             return
 
-        #Check clock
+        #Check clock edge type
         if self.options['cpol'] != clk:
             return
 
