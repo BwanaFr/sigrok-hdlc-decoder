@@ -146,10 +146,8 @@ class Decoder(srd.Decoder):
             self.put(self.rxbytes[0][0], self.rxbytes[-2][0], self.out_ann, [ann_data_type, ['TRANSFER']])
             self.put(self.rxbytes[-2][0], self.rxbytes[-1][1], self.out_ann, [ann_data_type, ['CRC']])
             transData = []
-            transBytes = []
             for x in self.rxbytes[0:-2]:
                 transData.append(Data(ss=x[0], es=x[1], val=x[2]))
-                transBytes.append(x[2])
             crc = self.crc16(self.rxbytes)
             rxCrc = ((self.rxbytes[-1][2] & 0xFF) << 8) | (self.rxbytes[-2][2] & 0xFF)
             if(crc != rxCrc):
@@ -159,7 +157,8 @@ class Decoder(srd.Decoder):
                 self.put(self.rxbytes[0][0], self.rxbytes[-2][0], self.out_python,
                     ['TRANSFER', transData])
                 #Send to binay
-                self.put(self.rxbytes[0][0], self.rxbytes[-2][0], self.out_binary, transBytes)
+                for x in self.rxbytes[0:-2]:
+                    self.put(x[0], x[0], self.out_binary, [0, x[2].to_bytes(1, byteorder='big')])
             self.put(self.rxbytes[0][0], self.rxbytes[-1][1], self.out_ann, [ann_transfer, [' '.join(format(x.val, '02X') for x in transData)]])    
             
     #Shifts bit
